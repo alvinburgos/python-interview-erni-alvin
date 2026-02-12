@@ -1,107 +1,136 @@
-from typing import Union
-
-from flask import Flask, request
-from datetime import date, datetime
-from dataclasses import dataclass
-import uuid
+from datetime import date
 # from pydantic import BaseModel
+from decimal import (
+    Decimal,
+    ROUND_DOWN,
+)
+from fastapi import FastAPI, HTTPException
+from sqlalchemy import (
+    select,
+)
+from sqlalchemy.orm import (
+    Session,
+)
+from models import (
+    Currency, Rate, Transaction
+)
+from sqlalchemy.exc import (
+    IntegrityError,
+    MultipleResultsFound,
+    NoResultFound,
+)
+from schemas import RateCreate, SideEnum, TransactionCreate
+from db import get_engine
+import dataclasses
 
-app = Flask(__name__)
+app = FastAPI()
 
-
-
-@dataclass
-class Rate:
-    id: int
-    rate_date: date
-    base_currency: str
-    quote_currency: str
-    side: str
-    rate: float
-    def __json__(self):
-        return {
-            "id": self.id,
-            "rate_date": self.rate_date,
-            "base_currency": self.base_currency,
-            "quote_currency": self.quote_currency,
-            "side": self.side,
-            "rate": "%.10f" % self.rate,
-        }
-
-@dataclass
-class Transaction:
-    transaction_id: str
-    timestamp: datetime
-    base_currency: str
-    quote_currency: str
-    side: str
-    rate_used: int
-    base_amount: float
-    foreign_amount: float
-    rounding_adjustment: float
-
-transactions = []
+# transactions = []
 rates = [
-    Rate(id=0, rate_date=date(2026, 1, 1), base_currency="PHP", quote_currency="USD", side="SELL", rate=1),
-    Rate(id=1, rate_date=date(2026, 1, 1), base_currency="PHP", quote_currency="USD", side="BUY", rate=2),
+    RateCreate(
+        rate_date=date(2026, 1, 1),
+        base_currency="PHP",
+        quote_currency="USD",
+        side=SideEnum.SELL,
+        rate=Decimal("1.12"),
+    ),
+    RateCreate(
+        rate_date=date(2026, 1, 1),
+        base_currency="PHP",
+        quote_currency="USD",
+        side=SideEnum.BUY,
+        rate=Decimal("2.13"),
+    ),
 ]
 
-@app.route("/rates", methods=["GET"])
+# transactions = [
+#     TransactionCreate(base_currency="PHP", quote_currency="USD", side=SideEnum.SELL, timestamp=datetime(2026, 1, 1), base_amount=Decimal("1.012345"), foreign_amount=Decimal("2")),
+# ]
+
+# print(transactions)
+
+
+
+
+@app.get("/rates")
 def get_rates():
-    return rates
+    with Session(get_engine()) as session:
+        result = session.execute(select(Rate)).all()
+    return [row[0] for row in result]
 
-@app.route("/rates", methods=["POST"])
-def update_rates():
-    data = request.get_json()
+
+@app.post("/rates")
+def update_rates(rate_create: RateCreate):
     # todo: validation
-    data["id"] = len(rates)
-    rates.append(data)
-    return "", 200
+    with Session(get_engine()) as session:
+        isos = (rate_create.base_currency, rate_create.quote_currency)
+        iso_to_currency = Currency.get_currencies_from_isos(isos)
+        for iso in isos:
+            if iso not in iso_to_currency:
+                raise HTTPException(422, f"Currency '{iso}' does not exist in the database.")
+        rate_dump = rate_create.model_dump()
+        rate_dump["base_currency_id"] = iso_to_currency[rate_dump.pop("base_currency")].id
+        rate_dump["quote_currency_id"] = iso_to_currency[rate_dump.pop("quote_currency")].id
+        try:
+            session.add(Rate(**rate_dump))
+            session.commit()
+        except IntegrityError as e:
+            raise HTTPException(422, detail={"error": 422, "message": "rate, side, base and quote currency should be unique collectively"})
+            
+    return {}
 
-@app.route("/transactions", methods=["GET"])
+@app.get("/transaction")
 def get_transactions():
-    return transactions
+    with Session(get_engine()) as session:
+        result = session.execute(select(Rate)).all()
+    return [row[0] for row in result]
 
-@app.route("/transaction", methods=["POST"])
-def create_transaction():
-    data = request.get_json()
-    timestamp = datetime.fromisoformat(data["timestamp"])
-    date_timestamp = timestamp.date()
-    base_amount = data.get("base_amount")
-    foreign_amount = data.get("foreign_amount")
-    if (base_amount is None) == (foreign_amount is None):
-        return {
-            "error": "You must specify only one of 'base_amount' and 'foreign_amount'"
-        }, 400
+@app.post("/transaction")
+def create_transaction(tc: TransactionCreate):
+    if (tc.base_amount is None) == (tc.foreign_amount is None):
+        raise HTTPException(
+            status_code=422, 
+            detail={"error": "You must specify only one of 'base_amount' and 'foreign_amount'"},
+        )
+    with Session(get_engine()) as session:
+        query = select(Rate).where(
+            Rate.rate_date == tc.timestamp.date(),
+            select(1).where(
+                Rate.base_currency_id == Currency.id,
+                Currency.iso == tc.base_currency,
+            ).exists(),
+            select(1).where(
+                Rate.quote_currency_id == Currency.id,
+                Currency.iso == tc.quote_currency,
+            ).exists(),
+            Rate.side == tc.side,
+        )
+        try:
+            rate = session.execute(query).one().tuple()[0]
+        except NoResultFound:
+            raise HTTPException(status_code=422, detail={"error": "No rate available"})
         
-    for rate in rates:
-        correct_pair = rate.base_currency == data["base_currency"] and rate.quote_currency == data["quote_currency"]
-
-        if not (correct_pair and rate.side == data["side"]):
-            continue
-        if rate.side == "SELL":
-            if foreign_amount is not None:
-                base_amount = foreign_amount / rate.rate
-            else:
-                foreign_amount = base_amount * rate.rate
-            transaction_id = uuid.uuid4().hex
-            rounded_version = int(foreign_amount * 100) / 100
-            rounding_adjustment = foreign_amount - rounded_version
-            foreign_amount = rounded_version
-            transactions.append(Transaction(
-                transaction_id=transaction_id,
-                timestamp=timestamp,
-                base_currency=rate.base_currency,
-                quote_currency=rate.quote_currency,
-                side=rate.side,
-                rate_used=rate.id,
-                base_amount=base_amount,
-                foreign_amount=foreign_amount,
-                rounding_adjustment=rounding_adjustment,
-            ))
-            return 
-        elif rate.side == "BUY":
-            return {"error": "Unimplemented"}, 400
-
-
-    return {"error": "No existing rates for the given currency pair and side"}, 400
+        data = tc.model_dump()
+        if tc.foreign_amount is not None:
+            data["base_amount"] = tc.foreign_amount / rate.rate
+        elif tc.base_amount is not None:
+            data["foreign_amount"] = tc.base_amount * rate.rate
+        data["rounded_version"] = data["foreign_amount"].quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        data["rounding_adjustment"] = data["foreign_amount"] - data["rounded_version"]
+        data["foreign_amount"] = data.pop("rounded_version")
+        data["rate_used_id"] = rate.id
+        data.pop("base_currency")
+        data.pop("quote_currency")
+        data.pop("side")
+        transaction = Transaction(**data)
+        session.add(transaction)
+        session.commit()
+        transaction_dump = dataclasses.asdict(transaction)
+        transaction_dump["base_currency"] = tc.base_currency
+        transaction_dump["quote_currency"] = tc.quote_currency
+        transaction_dump["side"] = tc.side
+        transaction_dump["effective_rate"] = rate.rate
+        transaction_dump["fee_amount"] = 0.0
+        transaction_dump.pop("rate_used")
+        return transaction_dump
+        
